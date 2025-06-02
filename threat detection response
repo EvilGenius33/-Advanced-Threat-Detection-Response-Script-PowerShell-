@@ -1,0 +1,72 @@
+
+# ===============================================
+# Advanced Threat Detection & Response Script
+# Author: Xenoz | Version: 1.0
+# Generated: 2025-06-01 15:06:05
+# ===============================================
+
+$logFile = "$env:USERPROFILE\Desktop\advanced_defense_log.txt"
+$vtApiKey = "<YOUR_VT_API_KEY>"
+$vtApi = "https://www.virustotal.com/api/v3/files/"
+$trustedUsers = @("SYSTEM", "Administrator", "TrustedInstaller")
+
+Function Log-And-Write($msg, $color="Yellow") {
+    Write-Host $msg -ForegroundColor $color
+    Add-Content -Path $logFile -Value "$(Get-Date -Format 'u') - $msg"
+}
+
+# Script Block Logging & Transcription
+New-Item -Path "HKLM:\Software\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging" -Force | Out-Null
+Set-ItemProperty -Path "HKLM:\Software\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging" -Name "EnableScriptBlockLogging" -Value 1
+New-Item -Path "HKLM:\Software\Policies\Microsoft\Windows\PowerShell\Transcription" -Force | Out-Null
+Set-ItemProperty -Path "HKLM:\Software\Policies\Microsoft\Windows\PowerShell\Transcription" -Name "EnableTranscripting" -Value 1
+Set-ItemProperty -Path "HKLM:\Software\Policies\Microsoft\Windows\PowerShell\Transcription" -Name "OutputDirectory" -Value "$env:SystemDrive\PSLogs"
+Log-And-Write "PowerShell Logging enabled"
+
+# Install Sysmon if not present
+$sysmonPath = "$env:TEMP\Sysmon64.exe"
+if (-not (Get-Process -Name sysmon -ErrorAction SilentlyContinue)) {
+    Invoke-WebRequest -Uri "https://download.sysinternals.com/files/Sysmon.zip" -OutFile "$env:TEMP\Sysmon.zip"
+    Expand-Archive -Path "$env:TEMP\Sysmon.zip" -DestinationPath "$env:TEMP\Sysmon" -Force
+    Start-Process -FilePath "$env:TEMP\Sysmon\Sysmon64.exe" -ArgumentList "-accepteula -i" -Wait
+    Log-And-Write "Sysmon installed"
+}
+
+# WMI Event Subscription for Security Events
+Register-WmiEvent -Query "Select * From __InstanceCreationEvent Within 2 Where TargetInstance ISA 'Win32_NTLogEvent' and TargetInstance.LogFile = 'Security'" -SourceIdentifier "AdvancedDefenseMITRE" -Action {
+    $evt = $Event.SourceEventArgs.NewEvent.TargetInstance
+    $id = $evt.EventCode
+
+    # Analyze common threats
+    switch ($id) {
+        1102 { Log-And-Write "[ALERT] Audit logs cleared! (T1070.001)" "Red" }
+        4698 { Log-And-Write "[ALERT] Scheduled Task Created (T1053.005)" }
+        4657 { Log-And-Write "[ALERT] Registry Modified (T1112)" }
+        4688 { 
+            $msg = $evt.Message
+            if ($msg -match "powershell.exe") {
+                Log-And-Write "[ALERT] Suspicious PowerShell Execution (T1059.001)" "Red"
+            }
+        }
+    }
+}
+
+# Hashing unknown binaries via Event ID 7
+Register-WmiEvent -Query "Select * From __InstanceCreationEvent Within 2 Where TargetInstance ISA 'Win32_NTLogEvent' and TargetInstance.EventCode = 7" -SourceIdentifier "SysmonDLLLoad" -Action {
+    $evt = $Event.SourceEventArgs.NewEvent.TargetInstance
+    $exe = ($evt.Message -split "Image loaded: ")[1] -split "`n" | Select-Object -First 1
+    if ($exe -and (Test-Path $exe)) {
+        try {
+            $hash = Get-FileHash -Path $exe -Algorithm SHA256
+            $headers = @{ "x-apikey" = "$vtApiKey" }
+            $res = Invoke-RestMethod -Uri "$vtApi$($hash.Hash)" -Headers $headers -ErrorAction Stop
+            if ($res.data.attributes.last_analysis_stats.malicious -gt 0) {
+                Log-And-Write "[ALERT] Malicious hash detected for $exe (VT hits: $($res.data.attributes.last_analysis_stats.malicious))" "Red"
+            }
+        } catch {
+            Log-And-Write "[!] VT lookup failed for $exe"
+        }
+    }
+}
+
+while ($true) { Start-Sleep -Seconds 5 }
